@@ -1,0 +1,82 @@
+name: Disposable rollback controls
+on:
+  pull_request:
+    branches: [trunk]
+  workflow_dispatch:
+    inputs:
+      pr:
+        required: true
+        type: string
+      head:
+        required: true
+        type: string
+      base:
+        required: true
+        type: string
+      stage:
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  pilot-evidence:
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify fixed Markdown pilot against protected base
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          TESTED: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = kburson/aitm-rollback-337
+          test "$(git rev-parse HEAD)" = "$TESTED"
+          test "$(git show -s --format=%P HEAD)" = "$BASE $HEAD"
+          git show "$BASE:.rollback-lab-mode.json" | jq -e '.mode == "pilot" and .selected_path == "docs/rollback-pilot-337.md"'
+          test "$(git diff --name-status "$BASE" "$TESTED")" = $'A\tdocs/rollback-pilot-337.md'
+          test "$(git show "$TESTED:docs/rollback-pilot-337.md")" = '# Disposable pilot probe'
+          jq -n --arg base "$BASE" --arg head "$HEAD" --arg tested "$TESTED" '{scope:"disposable pilot only",$base,$head,$tested}'
+
+  ordinary:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/trunk'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Attempt an ordinary exact-head merge
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr }}
+          HEAD: ${{ inputs.head }}
+          BASE: ${{ inputs.base }}
+          STAGE: ${{ inputs.stage }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = kburson/aitm-rollback-337
+          [[ "$PR" =~ ^[1-9][0-9]*$ && "$HEAD" =~ ^[0-9a-f]{40}$ && "$BASE" =~ ^[0-9a-f]{40}$ ]]
+          route="repos/$GITHUB_REPOSITORY"
+          test "$(gh api "$route/branches/trunk" --jq .commit.sha)" = "$BASE"
+          test "$(gh api "$route/pulls/$PR" --jq .head.sha)" = "$HEAD"
+          test "$(gh api "$route/pulls/$PR" --jq .base.ref)" = trunk
+          printf 'stage=%s pr=%s head=%s base=%s\n' "$STAGE" "$PR" "$HEAD" "$BASE"
+          if gh api --include "$route/pulls/$PR/merge" --method PUT -f sha="$HEAD" -f merge_method=merge > merge.log 2>&1; then
+            cat merge.log
+            echo 'Disposable merge unexpectedly applied'
+            exit 1
+          fi
+          cat merge.log
+          grep -Ei 'HTTP(/[0-9.]+)? (405|409)|HTTP (405|409)' merge.log
+          test "$(gh api "$route/branches/trunk" --jq .commit.sha)" = "$BASE"
